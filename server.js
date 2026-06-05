@@ -7,6 +7,11 @@ const host = process.env.HOST || '0.0.0.0';
 const root = resolve('dist');
 const yahooCache = new Map();
 const yahooCacheTtlMs = 5 * 60 * 1000;
+const yahooCacheMaxEntries = Number(process.env.YAHOO_CACHE_MAX_ENTRIES || 500);
+const yahooTimeoutMs = Number(process.env.YAHOO_TIMEOUT_MS || 12000);
+const rateLimitWindowMs = Number(process.env.RATE_LIMIT_WINDOW_MS || 60_000);
+const rateLimitMax = Number(process.env.RATE_LIMIT_MAX || 900);
+const clientHits = new Map();
 
 const mime = {
   '.html': 'text/html; charset=utf-8',
@@ -23,7 +28,62 @@ function send(res, status, body, headers = {}) {
   res.end(body);
 }
 
+function clientKey(req) {
+  const forwarded = req.headers['x-forwarded-for'];
+  if (typeof forwarded === 'string' && forwarded.trim()) {
+    return forwarded.split(',')[0].trim();
+  }
+  return req.socket.remoteAddress || 'unknown';
+}
+
+function isRateLimited(req) {
+  if (rateLimitMax <= 0) return false;
+  const now = Date.now();
+  const key = clientKey(req);
+  const bucket = clientHits.get(key) || [];
+  const recent = bucket.filter(ts => now - ts < rateLimitWindowMs);
+  recent.push(now);
+  clientHits.set(key, recent);
+  if (clientHits.size > 1000) {
+    for (const [client, hits] of clientHits) {
+      if (!hits.some(ts => now - ts < rateLimitWindowMs)) clientHits.delete(client);
+    }
+  }
+  return recent.length > rateLimitMax;
+}
+
+function getYahooCache(target) {
+  const cached = yahooCache.get(target);
+  if (!cached) return null;
+  if (cached.expiresAt <= Date.now()) {
+    yahooCache.delete(target);
+    return null;
+  }
+  yahooCache.delete(target);
+  yahooCache.set(target, cached);
+  return cached;
+}
+
+function setYahooCache(target, value) {
+  if (yahooCacheMaxEntries <= 0) return;
+  if (yahooCache.has(target)) yahooCache.delete(target);
+  while (yahooCache.size >= yahooCacheMaxEntries) {
+    const oldest = yahooCache.keys().next().value;
+    if (!oldest) break;
+    yahooCache.delete(oldest);
+  }
+  yahooCache.set(target, value);
+}
+
 async function proxyYahoo(req, res, url) {
+  if (isRateLimited(req)) {
+    send(res, 429, JSON.stringify({ error: 'Too many requests' }), {
+      'content-type': 'application/json; charset=utf-8',
+      'cache-control': 'no-store',
+    });
+    return;
+  }
+
   const match = url.pathname.match(/^\/yahoo\/v8\/finance\/chart\/([^/]+)$/);
   if (!match || url.searchParams.get('interval') !== '1d' || url.searchParams.get('range') !== '5y') {
     send(res, 400, JSON.stringify({ error: 'Unsupported Yahoo request' }), {
@@ -50,8 +110,8 @@ async function proxyYahoo(req, res, url) {
   }
 
   const target = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=1d&range=5y`;
-  const cached = yahooCache.get(target);
-  if (cached && cached.expiresAt > Date.now()) {
+  const cached = getYahooCache(target);
+  if (cached) {
     res.writeHead(200, {
       'content-type': cached.contentType,
       'cache-control': 'public, max-age=300',
@@ -60,17 +120,20 @@ async function proxyYahoo(req, res, url) {
     return;
   }
 
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), yahooTimeoutMs);
   try {
     const upstream = await fetch(target, {
       headers: {
         'user-agent': req.headers['user-agent'] || 'dashboard-app',
         'accept': 'application/json,text/plain,*/*',
       },
+      signal: controller.signal,
     });
     const body = Buffer.from(await upstream.arrayBuffer());
     const contentType = upstream.headers.get('content-type') || 'application/json; charset=utf-8';
     if (upstream.ok) {
-      yahooCache.set(target, {
+      setYahooCache(target, {
         body,
         contentType,
         expiresAt: Date.now() + yahooCacheTtlMs,
@@ -85,6 +148,8 @@ async function proxyYahoo(req, res, url) {
     send(res, 502, JSON.stringify({ error: error.message }), {
       'content-type': 'application/json; charset=utf-8',
     });
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
